@@ -1,0 +1,6 @@
+*.gguf
+outputs/
+data/
+node_modules/
+.venv/
+__pycache__/
