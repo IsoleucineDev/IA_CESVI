@@ -5,7 +5,8 @@ Uso básico:   python train.py
 Si hay OOM:   python train.py --seq 3072        (o --model unsloth/Qwen2.5-3B-Instruct-bnb-4bit)
 Prueba corta: python train.py --max_steps 20 --no_merge
 """
-import argparse, inspect, json, os
+import argparse, inspect, json, os, platform
+from pathlib import Path
 from unsloth import FastLanguageModel, is_bfloat16_supported   # unsloth SIEMPRE antes de trl/transformers
 from unsloth.chat_templates import train_on_responses_only
 import torch
@@ -29,6 +30,14 @@ ap.add_argument("--smoke", type=int, default=5, help="ejemplos de val para proba
 ap.add_argument("--no_merge", action="store_true")
 a = ap.parse_args()
 
+data_dir = Path(a.data)
+out_dir = Path(a.out)
+train_file = data_dir / "train.jsonl"
+val_file = data_dir / "val.jsonl"
+ckpt_dir = out_dir / "ckpt"
+lora_dir = out_dir / "lora"
+merged_dir = out_dir / "merged_16bit"
+
 # 1) Modelo base 4-bit + LoRA
 model, tok = FastLanguageModel.from_pretrained(a.model, max_seq_length=a.seq, dtype=None, load_in_4bit=True)
 model = FastLanguageModel.get_peft_model(
@@ -37,7 +46,7 @@ model = FastLanguageModel.get_peft_model(
     use_gradient_checkpointing="unsloth", random_state=3407)
 
 # 2) Dataset -> texto con la plantilla de chat del modelo; descarta lo que exceda seq
-ds = load_dataset("json", data_files={"train": f"{a.data}/train.jsonl", "val": f"{a.data}/val.jsonl"})
+ds = load_dataset("json", data_files={"train": str(train_file), "val": str(val_file)})
 ds = ds.map(lambda ex: {"text": tok.apply_chat_template(ex["messages"], tokenize=False, add_generation_prompt=False)})
 ntok = lambda t: len(tok(t, add_special_tokens=False).input_ids)
 lens = [ntok(t) for t in ds["train"]["text"]]
@@ -45,12 +54,12 @@ print(f"TOKENS por ejemplo: media {sum(lens)/len(lens):.0f} | max {max(lens)} | 
 before = len(ds["train"])
 ds = ds.filter(lambda ex: ntok(ex["text"]) <= a.seq)
 print(f"Ejemplos train: {before} -> {len(ds['train'])} (descartados por longitud: {before - len(ds['train'])})")
-raw_val = [json.loads(l) for l in open(f"{a.data}/val.jsonl", encoding="utf-8")]
+raw_val = [json.loads(l) for l in open(val_file, encoding="utf-8")]
 ds = ds.remove_columns(["messages"])
 
 # 3) Trainer (compatible con versiones nuevas y viejas de trl)
 cfg_kw = dict(
-    output_dir=f"{a.out}/ckpt", per_device_train_batch_size=a.bs, per_device_eval_batch_size=1,
+    output_dir=str(ckpt_dir), per_device_train_batch_size=a.bs, per_device_eval_batch_size=1,
     gradient_accumulation_steps=a.ga, num_train_epochs=a.epochs, max_steps=a.max_steps,
     learning_rate=a.lr, lr_scheduler_type="cosine", warmup_ratio=0.05, weight_decay=0.01,
     optim="adamw_8bit", bf16=is_bfloat16_supported(), fp16=not is_bfloat16_supported(),
@@ -58,6 +67,8 @@ cfg_kw = dict(
     save_total_limit=2, seed=3407, report_to="none", dataset_text_field="text", packing=False)
 fields = SFTConfig.__dataclass_fields__
 cfg_kw["max_length" if "max_length" in fields and "max_seq_length" not in fields else "max_seq_length"] = a.seq
+if platform.system() == "Windows" and "dataset_num_proc" in fields:
+    cfg_kw["dataset_num_proc"] = 1
 tr_kw = dict(model=model, train_dataset=ds["train"], eval_dataset=ds["val"], args=SFTConfig(**cfg_kw))
 tr_kw["processing_class" if "processing_class" in inspect.signature(SFTTrainer.__init__).parameters else "tokenizer"] = tok
 trainer = SFTTrainer(**tr_kw)
@@ -69,8 +80,8 @@ trainer.train()
 print(f"VRAM pico: {torch.cuda.max_memory_reserved()/1e9:.1f} GB")
 
 # 4) Guardar adaptador LoRA (pequeño; respaldo para re-fusionar después)
-model.save_pretrained(f"{a.out}/lora"); tok.save_pretrained(f"{a.out}/lora")
-print("Adaptador guardado en", f"{a.out}/lora")
+model.save_pretrained(str(lora_dir)); tok.save_pretrained(str(lora_dir))
+print("Adaptador guardado en", str(lora_dir))
 
 # 5) Prueba rápida: ¿el modelo emite JSON limpio y válido?
 if a.smoke:
@@ -91,5 +102,5 @@ if a.smoke:
 
 # 6) Fusionar LoRA + base a 16-bit (entrada para GGUF)
 if not a.no_merge:
-    model.save_pretrained_merged(f"{a.out}/merged_16bit", tok, save_method="merged_16bit")
-    print("Modelo fusionado en", f"{a.out}/merged_16bit")
+    model.save_pretrained_merged(str(merged_dir), tok, save_method="merged_16bit")
+    print("Modelo fusionado en", str(merged_dir))
