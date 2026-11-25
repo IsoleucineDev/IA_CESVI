@@ -39,11 +39,14 @@ Write-Host ""
 try {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
     $is64 = [Environment]::Is64BitOperatingSystem
+    $is64Proc = [Environment]::Is64BitProcess
     $build = [int]$os.BuildNumber
     $caption = $os.Caption.Trim()
     $isWin10Or11 = ($caption -match "Windows 10|Windows 11") -or ($build -ge 19041)
-    if ($is64 -and $isWin10Or11) {
+    if ($is64 -and $isWin10Or11 -and $is64Proc) {
         Add-Check "Sistema operativo" "OK" "$caption (Build $build, 64 bits)" "-"
+    } elseif ($is64 -and $isWin10Or11 -and (-not $is64Proc)) {
+        Add-Check "Sistema operativo" "FALLA" "$caption 64 bits, pero abriste PowerShell (x86) de 32 bits" "Cierra esta ventana y abre 'Windows PowerShell' de 64 bits (sin '(x86)')."
     } elseif (-not $is64) {
         Add-Check "Sistema operativo" "FALLA" "$caption (32 bits)" "Se requiere Windows 10 u 11 de 64 bits."
     } else {
@@ -53,31 +56,67 @@ try {
     Add-Check "Sistema operativo" "FALLA" "No se pudo consultar Win32_OperatingSystem: $_" "Verifica manualmente en Configuracion -> Sistema -> Acerca de."
 }
 
-# 2. GPU, VRAM y CUDA del driver (nvidia-smi)
-$nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
-if (-not $nvidiaSmi) {
-    $fallbackSmi = Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-    if (Test-Path $fallbackSmi) { $nvidiaSmi = Get-Command $fallbackSmi -ErrorAction SilentlyContinue }
-}
+function Find-NvidiaSmiPath {
+    $cmd = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
 
-if (-not $nvidiaSmi) {
-    Add-Check "GPU NVIDIA (nvidia-smi)" "FALLA" "No se encontro el comando nvidia-smi" "Instala el driver NVIDIA oficial (https://www.nvidia.com/Download/index.aspx) y reinicia."
-    Add-Check "CUDA del driver" "FALLA" "Sin nvidia-smi no se puede leer la version de CUDA" "Instala primero el driver NVIDIA actualizado."
-} else {
-    $gpuCsv = & $nvidiaSmi.Source --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>&1
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($gpuCsv -join ""))) {
-        Add-Check "GPU NVIDIA (nvidia-smi)" "FALLA" "nvidia-smi devolvio error: $gpuCsv" "Reinstala el driver NVIDIA y reinicia la PC."
-    } else {
-        $gpuLine = ($gpuCsv | Select-Object -First 1).ToString().Trim()
-        Add-Check "GPU NVIDIA y VRAM" "OK" $gpuLine "-"
+    $candidates = @(
+        (Join-Path $env:WINDIR "Sysnative\nvidia-smi.exe"),
+        (Join-Path $env:WINDIR "System32\nvidia-smi.exe")
+    )
+    if ($env:ProgramW6432) {
+        $candidates += (Join-Path $env:ProgramW6432 "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+    }
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+    }
+    foreach ($p in ($candidates | Select-Object -Unique)) {
+        if ($p -and (Test-Path $p)) { return $p }
     }
 
-    $smiFull = (& $nvidiaSmi.Source 2>&1) -join "`n"
-    if ($smiFull -match "CUDA Version:\s*(\d+\.\d+)") {
+    foreach ($repo in @(
+        (Join-Path $env:WINDIR "Sysnative\DriverStore\FileRepository"),
+        (Join-Path $env:WINDIR "System32\DriverStore\FileRepository")
+    )) {
+        if (Test-Path $repo) {
+            $found = Get-ChildItem -Path $repo -Directory -Filter "nv*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName "nvidia-smi.exe" } |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+            if ($found) { return $found }
+        }
+    }
+    return $null
+}
+
+# 2. GPU, VRAM y CUDA del driver (nvidia-smi)
+$nvidiaSmiPath = Find-NvidiaSmiPath
+
+if (-not $nvidiaSmiPath) {
+    $wmiNv = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "NVIDIA" } | Select-Object -First 1
+    if ($wmiNv) {
+        Add-Check "GPU NVIDIA (nvidia-smi)" "FALLA" "Windows detecta '$($wmiNv.Name)' (DriverVersion $($wmiNv.DriverVersion)), pero no se encontro nvidia-smi.exe en PATH ni en System32/NVSMI." "Reinicia la PC si acabas de instalar el driver, o reinstala el driver oficial NVIDIA (https://www.nvidia.com/Download/index.aspx)."
+    } else {
+        Add-Check "GPU NVIDIA (nvidia-smi)" "FALLA" "No se encontro el comando nvidia-smi ni GPU NVIDIA activa en Windows" "Instala el driver NVIDIA oficial (https://www.nvidia.com/Download/index.aspx) y reinicia."
+    }
+    Add-Check "CUDA del driver" "FALLA" "Sin nvidia-smi no se puede leer la version de CUDA" "Instala primero el driver NVIDIA actualizado y reinicia."
+} else {
+    $gpuCsv = & $nvidiaSmiPath --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>&1
+    $smiFull = (& $nvidiaSmiPath 2>&1) -join "`n"
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($gpuCsv -join ""))) {
+        $gpuLine = ($gpuCsv | Select-Object -First 1).ToString().Trim()
+        Add-Check "GPU NVIDIA y VRAM" "OK" "$gpuLine ($nvidiaSmiPath)" "-"
+    } elseif ($smiFull -match "Driver Version:\s*([\d\.]+)") {
+        Add-Check "GPU NVIDIA y VRAM" "OK" "Driver $($Matches[1]) detectado por $nvidiaSmiPath" "-"
+    } else {
+        Add-Check "GPU NVIDIA (nvidia-smi)" "FALLA" "nvidia-smi ($nvidiaSmiPath) devolvio error: $gpuCsv" "Reinstala el driver NVIDIA y reinicia la PC."
+    }
+
+    if ($smiFull -match "CUDA Version\s*:\s*(\d+\.\d+)") {
         $cudaVer = $Matches[1]
         Add-Check "CUDA del driver" "OK" "CUDA $cudaVer soportado por el driver" "-"
     } else {
-        Add-Check "CUDA del driver" "FALLA" "No se pudo detectar 'CUDA Version' en la salida de nvidia-smi" "Actualiza el driver NVIDIA a version 550 o superior."
+        Add-Check "CUDA del driver" "FALLA" "No se pudo detectar 'CUDA Version' en la salida de $nvidiaSmiPath" "Actualiza el driver NVIDIA a version 550 o superior."
     }
 }
 

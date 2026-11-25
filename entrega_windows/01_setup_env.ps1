@@ -56,34 +56,79 @@ function Find-Python312 {
     return $null
 }
 
+function Find-NvidiaSmiPath {
+    $cmd = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+
+    $candidates = @(
+        (Join-Path $env:WINDIR "Sysnative\nvidia-smi.exe"),
+        (Join-Path $env:WINDIR "System32\nvidia-smi.exe")
+    )
+    if ($env:ProgramW6432) {
+        $candidates += (Join-Path $env:ProgramW6432 "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+    }
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+    }
+    foreach ($p in ($candidates | Select-Object -Unique)) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+
+    foreach ($repo in @(
+        (Join-Path $env:WINDIR "Sysnative\DriverStore\FileRepository"),
+        (Join-Path $env:WINDIR "System32\DriverStore\FileRepository")
+    )) {
+        if (Test-Path $repo) {
+            $found = Get-ChildItem -Path $repo -Directory -Filter "nv*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName "nvidia-smi.exe" } |
+                Where-Object { Test-Path $_ } |
+                Select-Object -First 1
+            if ($found) { return $found }
+        }
+    }
+    return $null
+}
+
 function Resolve-PyTorchCudaIndex {
     param([string]$DriverCuda)
-    # Convierte "12.8" -> 128, "13.0" -> 130, etc.
+    # Convierte "12.8" -> 128, "13.3" -> 133, etc.
     $parts = $DriverCuda -split "\."
     $driverNum = ([int]$parts[0]) * 10 + ([int]$parts[1])
 
-    Write-Host "Consultando indices CUDA publicados en https://download.pytorch.org/whl/ ..." -ForegroundColor Cyan
-    try {
-        $html = (Invoke-WebRequest -Uri "https://download.pytorch.org/whl/" -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop).Content
-    } catch {
-        Fail-Step "No se pudo consultar https://download.pytorch.org/whl/: $($_.Exception.Message)"
-    }
-
-    $regexMatches = [regex]::Matches($html, 'href="[^"]*?(cu\d{3,4})/?[^"]*"')
-    $tags = New-Object System.Collections.Generic.List[object]
+    Write-Host "Consultando indices CUDA publicados en PyTorch (sin hardcodear)..." -ForegroundColor Cyan
     $seen = @{}
-    foreach ($m in $regexMatches) {
-        $tag = $m.Groups[1].Value
-        if ($seen.ContainsKey($tag)) { continue }
-        $seen[$tag] = $true
-        $num = [int]($tag.Substring(2))
+    $tags = New-Object System.Collections.Generic.List[object]
+
+    function Add-CandidateTag {
+        param([string]$Tag)
+        if ($seen.ContainsKey($Tag)) { return }
+        $seen[$Tag] = $true
+        $num = [int]($Tag.Substring(2))
         if ($num -le $driverNum) {
-            $tags.Add([PSCustomObject]@{ Tag = $tag; Num = $num })
+            $tags.Add([PSCustomObject]@{ Tag = $Tag; Num = $num })
         }
     }
 
+    # 1) Descubrir tags reales con wheels torch cp312 win_amd64 en /whl/torch/
+    try {
+        $torchHtml = (Invoke-WebRequest -Uri "https://download.pytorch.org/whl/torch/" -TimeoutSec 25 -UseBasicParsing -ErrorAction Stop).Content
+        $wheelMatches = [regex]::Matches($torchHtml, '(?:%2B|\+)(cu\d{3,4})-cp312-cp312-win_amd64\.whl')
+        foreach ($m in $wheelMatches) { Add-CandidateTag $m.Groups[1].Value }
+    } catch {
+        Write-Host "AVISO: No se pudo listar /whl/torch/: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # 2) Tambien revisar la pagina oficial pytorch.org/get-started/locally/
+    try {
+        $gsHtml = (Invoke-WebRequest -Uri "https://pytorch.org/get-started/locally/" -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop).Content
+        $gsMatches = [regex]::Matches($gsHtml, 'download\.pytorch\.org/whl/(cu\d{3,4})')
+        foreach ($m in $gsMatches) { Add-CandidateTag $m.Groups[1].Value }
+    } catch {
+        Write-Host "AVISO: No se pudo consultar pytorch.org/get-started/locally/: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     if ($tags.Count -eq 0) {
-        Fail-Step "No se encontro ningun indice CUDA en https://download.pytorch.org/whl/ compatible con CUDA $DriverCuda del driver."
+        Fail-Step "No se pudo descubrir ningun indice CUDA de PyTorch compatible con CUDA $DriverCuda en download.pytorch.org/whl/torch/ ni pytorch.org."
     }
 
     $ordered = $tags | Sort-Object -Property Num -Descending
@@ -115,17 +160,13 @@ try {
     Write-Host "[1/8] Python 3.12 encontrado: $Py312" -ForegroundColor Green
 
     # 2. Leer version de CUDA desde nvidia-smi
-    $nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
-    if (-not $nvidiaSmi) {
-        $fallbackSmi = Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-        if (Test-Path $fallbackSmi) { $nvidiaSmi = Get-Command $fallbackSmi -ErrorAction SilentlyContinue }
-    }
-    if (-not $nvidiaSmi) {
+    $nvidiaSmiPath = Find-NvidiaSmiPath
+    if (-not $nvidiaSmiPath) {
         Fail-Step "No se encontro nvidia-smi. Instala el driver NVIDIA oficial y reinicia la PC."
     }
-    $smiOut = (& $nvidiaSmi.Source 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or -not ($smiOut -match "CUDA Version:\s*(\d+\.\d+)")) {
-        Fail-Step "No se pudo leer la version de CUDA en nvidia-smi. Actualiza el driver NVIDIA."
+    $smiOut = (& $nvidiaSmiPath 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or -not ($smiOut -match "CUDA Version\s*:\s*(\d+\.\d+)")) {
+        Fail-Step "No se pudo leer la version de CUDA en nvidia-smi ($nvidiaSmiPath). Actualiza el driver NVIDIA."
     }
     $DriverCuda = $Matches[1]
     Write-Host "[2/8] Driver NVIDIA reporta CUDA Version: $DriverCuda" -ForegroundColor Green

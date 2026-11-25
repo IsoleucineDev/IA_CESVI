@@ -45,14 +45,23 @@ try {
 }
 
 # nvidia-smi
-$nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
-if (-not $nvidiaSmi) {
-    $fallbackSmi = Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-    if (Test-Path $fallbackSmi) { $nvidiaSmi = Get-Command $fallbackSmi -ErrorAction SilentlyContinue }
+$nvidiaSmiPath = $null
+$cmdSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+if ($cmdSmi -and (Test-Path $cmdSmi.Source)) {
+    $nvidiaSmiPath = $cmdSmi.Source
+} else {
+    foreach ($p in @(
+        (Join-Path $env:WINDIR "Sysnative\nvidia-smi.exe"),
+        (Join-Path $env:WINDIR "System32\nvidia-smi.exe"),
+        (Join-Path $env:ProgramW6432 "NVIDIA Corporation\NVSMI\nvidia-smi.exe"),
+        (Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe")
+    )) {
+        if ($p -and (Test-Path $p)) { $nvidiaSmiPath = $p; break }
+    }
 }
-if ($nvidiaSmi) {
-    $smiOut = (& $nvidiaSmi.Source 2>&1) -join "`n"
-    Add-Section "NVIDIA-SMI" $smiOut
+if ($nvidiaSmiPath) {
+    $smiOut = (& $nvidiaSmiPath 2>&1) -join "`n"
+    Add-Section "NVIDIA-SMI ($nvidiaSmiPath)" $smiOut
 } else {
     Add-Section "NVIDIA-SMI" "No se encontro nvidia-smi."
 }
